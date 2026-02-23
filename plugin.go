@@ -59,6 +59,17 @@ func (p *AnthropicPlugin) Scopes(ctx context.Context) ([]sdk.ScopeSpec, error) {
 	}, nil
 }
 
+func (p *AnthropicPlugin) ConfigSchema(ctx context.Context) ([]sdk.ConfigField, error) {
+	return []sdk.ConfigField{
+		{
+			Name:        "admin_key",
+			Type:        "secret",
+			Description: "Anthropic Admin API key (requires Scale/Enterprise plan)",
+			Required:    true,
+		},
+	}, nil
+}
+
 func (p *AnthropicPlugin) Configure(ctx context.Context, configJSON string) error {
 	var config AnthropicConfig
 	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
