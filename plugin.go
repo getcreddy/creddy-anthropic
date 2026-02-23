@@ -70,6 +70,11 @@ func (p *AnthropicPlugin) ConfigSchema(ctx context.Context) ([]sdk.ConfigField, 
 	}, nil
 }
 
+func (p *AnthropicPlugin) Constraints(ctx context.Context) (*sdk.Constraints, error) {
+	// Anthropic API keys don't have inherent TTL limits - Creddy manages expiration via revocation
+	return nil, nil
+}
+
 func (p *AnthropicPlugin) Configure(ctx context.Context, configJSON string) error {
 	var config AnthropicConfig
 	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {

@@ -2,7 +2,7 @@ module github.com/getcreddy/creddy-anthropic
 
 go 1.24.0
 
-require github.com/getcreddy/creddy-plugin-sdk v0.0.0-20260223033639-e09e89c176ce
+require github.com/getcreddy/creddy-plugin-sdk v0.0.0-20260223035836-0cafb6469018
 
 require (
 	github.com/fatih/color v1.13.0 // indirect
