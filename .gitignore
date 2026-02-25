@@ -24,3 +24,4 @@ vendor/
 # Config files with secrets
 config.json
 *.local.json
+creddy-anthropic

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -34,7 +33,7 @@ func (p *Proxy) Start() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", p.handleRequest)
 	mux.HandleFunc("/health", p.handleHealth)
-	mux.HandleFunc("/v1/tokens", p.handleIssueToken) // Token issuance endpoint
+	mux.HandleFunc("/_creddy/status", p.handleStatus)
 
 	p.server = &http.Server{
 		Addr:         p.listenAddr,
@@ -44,13 +43,14 @@ func (p *Proxy) Start() error {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	log.Printf("Anthropic proxy starting on %s", p.listenAddr)
+	log.Printf("[anthropic-proxy] Starting on %s", p.listenAddr)
 	return p.server.ListenAndServe()
 }
 
 // Stop gracefully shuts down the proxy
 func (p *Proxy) Stop() error {
 	if p.server != nil {
+		log.Printf("[anthropic-proxy] Shutting down")
 		return p.server.Close()
 	}
 	return nil
@@ -61,89 +61,42 @@ func (p *Proxy) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("ok"))
 }
 
-// handleIssueToken issues a new proxy token
-func (p *Proxy) handleIssueToken(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Parse request
-	var req struct {
-		TTL       string `json:"ttl"`
-		AgentName string `json:"agent_name"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		// Default values if no body
-		req.TTL = "1h"
-		req.AgentName = "anonymous"
-	}
-
-	// Parse TTL
-	ttl, err := time.ParseDuration(req.TTL)
-	if err != nil {
-		ttl = 1 * time.Hour
-	}
-
-	// Cap TTL at 24h
-	if ttl > 24*time.Hour {
-		ttl = 24 * time.Hour
-	}
-
-	// Generate token
-	token, err := generateToken()
-	if err != nil {
-		http.Error(w, `{"error": "failed to generate token"}`, http.StatusInternalServerError)
-		return
-	}
-
-	expiresAt := time.Now().Add(ttl)
-
-	// Store token
-	p.plugin.store.Add(token, &TokenInfo{
-		AgentName: req.AgentName,
-		Scope:     "anthropic",
-		ExpiresAt: expiresAt,
-		CreatedAt: time.Now(),
-	})
-
-	// Return token
+func (p *Proxy) handleStatus(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"token":      token,
-		"expires_at": expiresAt.Format(time.RFC3339),
-		"ttl":        ttl.String(),
-	})
-
-	log.Printf("Issued token for agent=%s ttl=%s", req.AgentName, ttl)
+	fmt.Fprintf(w, `{"active_tokens": %d}`, p.plugin.GetTokenCount())
 }
 
 func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request) {
-	// Extract the Creddy token from Authorization header
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		// Also check x-api-key header (Anthropic's native header)
-		authHeader = r.Header.Get("x-api-key")
-		if authHeader == "" {
-			http.Error(w, `{"error": {"type": "authentication_error", "message": "Missing API key"}}`, http.StatusUnauthorized)
-			return
-		}
-	} else {
-		// Strip "Bearer " prefix if present
-		authHeader = strings.TrimPrefix(authHeader, "Bearer ")
+	// Don't proxy health/status endpoints
+	if r.URL.Path == "/health" || r.URL.Path == "/_creddy/status" {
+		return
 	}
 
-	token := authHeader
+	// Extract the token from Authorization header or x-api-key
+	token := ""
+	authHeader := r.Header.Get("Authorization")
+	if authHeader != "" {
+		token = strings.TrimPrefix(authHeader, "Bearer ")
+	}
+	if token == "" {
+		token = r.Header.Get("x-api-key")
+	}
 
-	// Validate the Creddy token
+	if token == "" {
+		http.Error(w, `{"error": {"type": "authentication_error", "message": "Missing API key"}}`, http.StatusUnauthorized)
+		return
+	}
+
+	// Validate the token exists in our store
+	// Note: Expiry is managed by Creddy - if token is in store, it's valid
 	tokenInfo, valid := p.plugin.ValidateToken(token)
 	if !valid {
-		http.Error(w, `{"error": {"type": "authentication_error", "message": "Invalid or expired token"}}`, http.StatusUnauthorized)
+		http.Error(w, `{"error": {"type": "authentication_error", "message": "Invalid or revoked token"}}`, http.StatusUnauthorized)
 		return
 	}
 
 	// Log the request (without sensitive data)
-	log.Printf("Proxying request: %s %s (agent: %s, scope: %s)", r.Method, r.URL.Path, tokenInfo.AgentName, tokenInfo.Scope)
+	log.Printf("[anthropic-proxy] %s %s (agent: %s)", r.Method, r.URL.Path, tokenInfo.AgentName)
 
 	// Create the upstream request
 	upstreamURL := AnthropicAPIURL + r.URL.Path
@@ -159,7 +112,6 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Copy headers, but replace auth with real API key
 	for key, values := range r.Header {
-		// Skip hop-by-hop headers and auth headers
 		if isHopByHop(key) || key == "Authorization" || key == "X-Api-Key" {
 			continue
 		}
@@ -170,7 +122,7 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Set the real Anthropic API key
 	upstreamReq.Header.Set("x-api-key", p.plugin.GetAPIKey())
-	
+
 	// Ensure required Anthropic headers
 	if upstreamReq.Header.Get("anthropic-version") == "" {
 		upstreamReq.Header.Set("anthropic-version", "2023-06-01")
@@ -178,12 +130,12 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Make the upstream request
 	client := &http.Client{
-		Timeout: 120 * time.Second, // Long timeout for streaming
+		Timeout: 120 * time.Second,
 	}
 
 	upstreamResp, err := client.Do(upstreamReq)
 	if err != nil {
-		log.Printf("Upstream request failed: %v", err)
+		log.Printf("[anthropic-proxy] Upstream error: %v", err)
 		http.Error(w, fmt.Sprintf(`{"error": {"type": "upstream_error", "message": "Failed to reach Anthropic API: %s"}}`, err.Error()), http.StatusBadGateway)
 		return
 	}
@@ -204,10 +156,8 @@ func (p *Proxy) handleRequest(w http.ResponseWriter, r *http.Request) {
 	isStreaming := strings.Contains(contentType, "text/event-stream")
 
 	if isStreaming {
-		// Handle SSE streaming
 		p.handleStreaming(w, upstreamResp)
 	} else {
-		// Regular response
 		w.WriteHeader(upstreamResp.StatusCode)
 		io.Copy(w, upstreamResp.Body)
 	}
@@ -218,39 +168,36 @@ func (p *Proxy) handleStreaming(w http.ResponseWriter, upstreamResp *http.Respon
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no") // Disable nginx buffering
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(upstreamResp.StatusCode)
 
-	// Get the flusher
 	flusher, ok := w.(http.Flusher)
 	if !ok {
-		log.Printf("Warning: ResponseWriter does not support flushing")
+		log.Printf("[anthropic-proxy] Warning: ResponseWriter does not support flushing")
 		io.Copy(w, upstreamResp.Body)
 		return
 	}
 
-	// Stream the response
 	buf := make([]byte, 4096)
 	for {
 		n, err := upstreamResp.Body.Read(buf)
 		if n > 0 {
 			_, writeErr := w.Write(buf[:n])
 			if writeErr != nil {
-				log.Printf("Error writing response: %v", writeErr)
+				log.Printf("[anthropic-proxy] Write error: %v", writeErr)
 				return
 			}
 			flusher.Flush()
 		}
 		if err != nil {
 			if err != io.EOF {
-				log.Printf("Error reading upstream: %v", err)
+				log.Printf("[anthropic-proxy] Read error: %v", err)
 			}
 			return
 		}
 	}
 }
 
-// isHopByHop returns true for hop-by-hop headers that shouldn't be proxied
 func isHopByHop(header string) bool {
 	hopByHop := map[string]bool{
 		"Connection":          true,

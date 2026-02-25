@@ -3,89 +3,98 @@ package main
 import (
 	"encoding/json"
 	"flag"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	sdk "github.com/getcreddy/creddy-plugin-sdk"
 )
 
+var plugin *AnthropicPlugin
+
 func main() {
-	// CLI flags
-	proxyMode := flag.Bool("proxy", false, "Run in proxy mode")
-	proxyAddr := flag.String("addr", ":8080", "Proxy listen address")
-	apiKey := flag.String("api-key", "", "Anthropic API key (can also use ANTHROPIC_API_KEY env var)")
+	// CLI flags for standalone/testing
+	standaloneProxy := flag.Bool("proxy", false, "Run proxy in standalone mode (for testing)")
+	proxyAddr := flag.String("addr", ":8401", "Proxy listen address")
+	apiKey := flag.String("api-key", "", "Anthropic API key (or ANTHROPIC_API_KEY env)")
 	flag.Parse()
 
-	if *proxyMode {
-		runProxy(*proxyAddr, *apiKey)
-	} else {
-		// Plugin mode - serve via Creddy plugin SDK
-		sdk.ServeWithStandalone(&AnthropicPlugin{}, nil)
+	// Create the shared plugin instance
+	plugin = NewAnthropicPlugin()
+
+	if *standaloneProxy {
+		runStandaloneProxy(*proxyAddr, *apiKey)
+		return
 	}
+
+	// Check if running as Creddy plugin (gRPC mode)
+	if os.Getenv("CREDDY_PLUGIN") == "creddy" {
+		runAsCreddyPlugin()
+		return
+	}
+
+	// Default: standalone CLI for testing
+	sdk.ServeWithStandalone(plugin, nil)
 }
 
-func runProxy(addr string, apiKey string) {
-	// Get API key from flag or environment
+// runAsCreddyPlugin runs the plugin with integrated proxy
+func runAsCreddyPlugin() {
+	// Get proxy port from env (Creddy can set this)
+	proxyPort := os.Getenv("CREDDY_ANTHROPIC_PROXY_PORT")
+	if proxyPort == "" {
+		proxyPort = "8401"
+	}
+
+	// Start proxy server in background
+	// It will wait for Configure() to be called before it can validate tokens
+	go func() {
+		proxy := NewProxy(plugin, ":"+proxyPort)
+		log.Printf("[anthropic] Starting proxy on :%s", proxyPort)
+		if err := proxy.Start(); err != nil {
+			log.Printf("[anthropic] Proxy error: %v", err)
+		}
+	}()
+
+	// Give proxy a moment to start
+	time.Sleep(100 * time.Millisecond)
+
+	// Run the SDK server (handles gRPC calls from Creddy)
+	sdk.Serve(plugin)
+}
+
+// runStandaloneProxy runs just the proxy for testing
+func runStandaloneProxy(addr string, apiKey string) {
 	if apiKey == "" {
 		apiKey = os.Getenv("ANTHROPIC_API_KEY")
 	}
 	if apiKey == "" {
-		log.Fatal("API key required: use --api-key flag or ANTHROPIC_API_KEY env var")
+		log.Fatal("API key required: --api-key or ANTHROPIC_API_KEY env")
 	}
 
-	// Create and configure the plugin
-	plugin := &AnthropicPlugin{}
-	
-	configJSON, _ := json.Marshal(map[string]string{
+	configJSON, _ := json.Marshal(map[string]interface{}{
 		"api_key": apiKey,
 	})
-	
+
 	if err := plugin.Configure(nil, string(configJSON)); err != nil {
-		log.Fatalf("Failed to configure plugin: %v", err)
+		log.Fatalf("Configure failed: %v", err)
 	}
 
-	// Create the proxy
-	proxy := NewProxy(plugin, addr)
-
-	// Handle graceful shutdown
+	// Handle shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
 		<-sigChan
-		log.Println("Shutting down proxy...")
-		proxy.Stop()
+		log.Println("Shutting down...")
 		os.Exit(0)
 	}()
 
-	// Start the proxy
-	fmt.Printf(`
-Anthropic Proxy Server
-======================
-Listening on: %s
-Upstream:     https://api.anthropic.com
+	log.Printf("[anthropic] Standalone proxy on %s", addr)
+	log.Printf("[anthropic] WARNING: Standalone mode - tokens won't persist across restarts")
 
-Usage:
-  1. Get a token:
-     curl -X POST http://localhost%s/v1/tokens -d '{"ttl":"1h","agent_name":"my-agent"}'
-
-  2. Configure your agent:
-     export ANTHROPIC_BASE_URL=http://localhost%s
-     export ANTHROPIC_API_KEY=<token-from-step-1>
-
-  3. Make API calls as normal - they'll be proxied to Anthropic
-
-Endpoints:
-  POST /v1/tokens     - Issue a new token
-  GET  /health        - Health check
-  *    /v1/*          - Proxied to Anthropic API
-
-Press Ctrl+C to stop.
-`, addr, addr, addr)
-
+	proxy := NewProxy(plugin, addr)
 	if err := proxy.Start(); err != nil {
 		log.Fatalf("Proxy failed: %v", err)
 	}

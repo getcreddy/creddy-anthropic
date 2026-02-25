@@ -21,18 +21,21 @@ const (
 )
 
 // AnthropicPlugin implements the Creddy Plugin interface for Anthropic
+// It also runs an HTTP proxy for agents to use
 type AnthropicPlugin struct {
-	config *AnthropicConfig
-	store  *TokenStore
+	mu        sync.RWMutex
+	config    *AnthropicConfig
+	store     *TokenStore
+	proxyPort int
 }
 
 // AnthropicConfig contains the plugin configuration
 type AnthropicConfig struct {
-	APIKey       string `json:"api_key"`        // Real Anthropic API key
-	CreddyServer string `json:"creddy_server"`  // Creddy server URL (for proxy validation)
+	APIKey    string `json:"api_key"`    // Real Anthropic API key
+	ProxyPort int    `json:"proxy_port"` // Port for the proxy server (default 8401)
 }
 
-// TokenStore manages the mapping between Creddy tokens and the real API key
+// TokenStore manages valid tokens
 type TokenStore struct {
 	mu     sync.RWMutex
 	tokens map[string]*TokenInfo
@@ -42,71 +45,61 @@ type TokenStore struct {
 type TokenInfo struct {
 	AgentName string
 	Scope     string
-	ExpiresAt time.Time
 	CreatedAt time.Time
 }
 
-// NewTokenStore creates a new token store
 func NewTokenStore() *TokenStore {
 	return &TokenStore{
 		tokens: make(map[string]*TokenInfo),
 	}
 }
 
-// Add stores a new token
 func (s *TokenStore) Add(token string, info *TokenInfo) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.tokens[token] = info
 }
 
-// Get retrieves token info if valid
-func (s *TokenStore) Get(token string) (*TokenInfo, bool) {
+func (s *TokenStore) Exists(token string) (*TokenInfo, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	info, ok := s.tokens[token]
-	if !ok {
-		return nil, false
-	}
-	if time.Now().After(info.ExpiresAt) {
-		return nil, false
-	}
-	return info, true
+	return info, ok
 }
 
-// Remove deletes a token
 func (s *TokenStore) Remove(token string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.tokens, token)
 }
 
-// Cleanup removes expired tokens
-func (s *TokenStore) Cleanup() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now()
-	for token, info := range s.tokens {
-		if now.After(info.ExpiresAt) {
-			delete(s.tokens, token)
-		}
-	}
+func (s *TokenStore) Count() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.tokens)
 }
 
-// generateToken creates a secure random token
 func generateToken() (string, error) {
 	bytes := make([]byte, 32)
 	if _, err := rand.Read(bytes); err != nil {
 		return "", err
 	}
-	return "crd_" + hex.EncodeToString(bytes), nil
+	return "crd_ant_" + hex.EncodeToString(bytes), nil
+}
+
+// NewAnthropicPlugin creates a plugin with initialized store
+func NewAnthropicPlugin() *AnthropicPlugin {
+	return &AnthropicPlugin{
+		store:     NewTokenStore(),
+		proxyPort: 8401, // Default, can be overridden by config
+	}
 }
 
 func (p *AnthropicPlugin) Info(ctx context.Context) (*sdk.PluginInfo, error) {
 	return &sdk.PluginInfo{
 		Name:             PluginName,
 		Version:          PluginVersion,
-		Description:      "Anthropic API access via proxy (no Admin API required)",
+		Description:      "Anthropic API access via proxy",
 		MinCreddyVersion: "0.4.0",
 	}, nil
 }
@@ -131,8 +124,14 @@ func (p *AnthropicPlugin) ConfigSchema(ctx context.Context) ([]sdk.ConfigField, 
 		{
 			Name:        "api_key",
 			Type:        "secret",
-			Description: "Anthropic API key (regular key, not admin)",
+			Description: "Anthropic API key",
 			Required:    true,
+		},
+		{
+			Name:        "proxy_port",
+			Type:        "number",
+			Description: "Port for the proxy server (default 8401)",
+			Required:    false,
 		},
 	}, nil
 }
@@ -151,32 +150,33 @@ func (p *AnthropicPlugin) Configure(ctx context.Context, configJSON string) erro
 		return fmt.Errorf("api_key is required")
 	}
 
-	p.config = &config
-	p.store = NewTokenStore()
+	if config.ProxyPort == 0 {
+		config.ProxyPort = 8401
+	}
 
-	// Start background cleanup
-	go func() {
-		ticker := time.NewTicker(1 * time.Minute)
-		for range ticker.C {
-			p.store.Cleanup()
-		}
-	}()
+	p.mu.Lock()
+	p.config = &config
+	p.proxyPort = config.ProxyPort
+	p.mu.Unlock()
 
 	return nil
 }
 
 func (p *AnthropicPlugin) Validate(ctx context.Context) error {
-	if p.config == nil {
+	p.mu.RLock()
+	config := p.config
+	p.mu.RUnlock()
+
+	if config == nil {
 		return fmt.Errorf("plugin not configured")
 	}
 
-	// Validate the API key by making a simple request
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.anthropic.com/v1/models", nil)
 	if err != nil {
 		return err
 	}
 
-	req.Header.Set("x-api-key", p.config.APIKey)
+	req.Header.Set("x-api-key", config.APIKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 
 	resp, err := http.DefaultClient.Do(req)
@@ -197,44 +197,42 @@ func (p *AnthropicPlugin) Validate(ctx context.Context) error {
 }
 
 func (p *AnthropicPlugin) GetCredential(ctx context.Context, req *sdk.CredentialRequest) (*sdk.Credential, error) {
-	if p.config == nil {
+	p.mu.RLock()
+	config := p.config
+	proxyPort := p.proxyPort
+	p.mu.RUnlock()
+
+	if config == nil {
 		return nil, fmt.Errorf("plugin not configured")
 	}
 
-	// Generate a Creddy token (NOT the real Anthropic key)
 	token, err := generateToken()
 	if err != nil {
 		return nil, fmt.Errorf("failed to generate token: %w", err)
 	}
 
-	expiresAt := time.Now().Add(req.TTL)
-
-	// Store the token mapping
+	// Store token for proxy validation
 	p.store.Add(token, &TokenInfo{
 		AgentName: req.Agent.Name,
 		Scope:     req.Scope,
-		ExpiresAt: expiresAt,
 		CreatedAt: time.Now(),
 	})
 
+	proxyURL := fmt.Sprintf("http://localhost:%d", proxyPort)
+
 	return &sdk.Credential{
 		Value:      token,
-		ExternalID: token, // Use token as external ID for revocation
-		ExpiresAt:  expiresAt,
+		ExternalID: token,
+		ExpiresAt:  time.Now().Add(req.TTL),
 		Metadata: map[string]string{
-			"type":       "proxy_token",
+			"proxy_url":  proxyURL,
 			"agent_name": req.Agent.Name,
 			"scope":      req.Scope,
-			"note":       "Use with ANTHROPIC_BASE_URL pointing to the Creddy Anthropic proxy",
 		},
 	}, nil
 }
 
 func (p *AnthropicPlugin) RevokeCredential(ctx context.Context, externalID string) error {
-	if p.config == nil {
-		return fmt.Errorf("plugin not configured")
-	}
-
 	p.store.Remove(externalID)
 	return nil
 }
@@ -243,15 +241,33 @@ func (p *AnthropicPlugin) MatchScope(ctx context.Context, scope string) (bool, e
 	return scope == "anthropic" || strings.HasPrefix(scope, "anthropic:"), nil
 }
 
-// GetAPIKey returns the real API key (for proxy use)
+// --- Proxy support ---
+
 func (p *AnthropicPlugin) GetAPIKey() string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	if p.config == nil {
 		return ""
 	}
 	return p.config.APIKey
 }
 
-// ValidateToken checks if a token is valid and returns its info
 func (p *AnthropicPlugin) ValidateToken(token string) (*TokenInfo, bool) {
-	return p.store.Get(token)
+	return p.store.Exists(token)
+}
+
+func (p *AnthropicPlugin) GetProxyPort() int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.proxyPort
+}
+
+func (p *AnthropicPlugin) GetTokenCount() int {
+	return p.store.Count()
+}
+
+func (p *AnthropicPlugin) IsConfigured() bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.config != nil
 }
