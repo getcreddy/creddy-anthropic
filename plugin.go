@@ -2,14 +2,11 @@ package main
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	sdk "github.com/getcreddy/creddy-plugin-sdk"
@@ -21,89 +18,90 @@ const (
 )
 
 // AnthropicPlugin implements the Creddy Plugin interface for Anthropic
-// It also runs an HTTP proxy for agents to use
 type AnthropicPlugin struct {
-	mu        sync.RWMutex
-	config    *AnthropicConfig
-	store     *TokenStore
-	proxyPort int
+	config *AnthropicConfig
 }
 
 // AnthropicConfig contains the plugin configuration
 type AnthropicConfig struct {
-	APIKey    string `json:"api_key"`    // Real Anthropic API key
-	ProxyPort int    `json:"proxy_port"` // Port for the proxy server (default 8401)
+	APIKey string `json:"api_key"` // Real Anthropic API key
 }
 
-// TokenStore manages valid tokens
-type TokenStore struct {
-	mu     sync.RWMutex
-	tokens map[string]*TokenInfo
+func NewPlugin() *AnthropicPlugin {
+	return &AnthropicPlugin{}
 }
 
-// TokenInfo holds token metadata
-type TokenInfo struct {
-	AgentName string
-	Scope     string
-	CreatedAt time.Time
-}
-
-func NewTokenStore() *TokenStore {
-	return &TokenStore{
-		tokens: make(map[string]*TokenInfo),
-	}
-}
-
-func (s *TokenStore) Add(token string, info *TokenInfo) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.tokens[token] = info
-}
-
-func (s *TokenStore) Exists(token string) (*TokenInfo, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	info, ok := s.tokens[token]
-	return info, ok
-}
-
-func (s *TokenStore) Remove(token string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.tokens, token)
-}
-
-func (s *TokenStore) Count() int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return len(s.tokens)
-}
-
-func generateToken() (string, error) {
-	bytes := make([]byte, 32)
-	if _, err := rand.Read(bytes); err != nil {
-		return "", err
-	}
-	return "crd_ant_" + hex.EncodeToString(bytes), nil
-}
-
-// NewAnthropicPlugin creates a plugin with initialized store
-func NewAnthropicPlugin() *AnthropicPlugin {
-	return &AnthropicPlugin{
-		store:     NewTokenStore(),
-		proxyPort: 8401, // Default, can be overridden by config
-	}
-}
-
+// Info returns plugin metadata
 func (p *AnthropicPlugin) Info(ctx context.Context) (*sdk.PluginInfo, error) {
 	return &sdk.PluginInfo{
 		Name:             PluginName,
 		Version:          PluginVersion,
-		Description:      "Anthropic API access via proxy",
+		Description:      "Anthropic API access via Creddy proxy",
 		MinCreddyVersion: "0.4.0",
 	}, nil
 }
 
+// ConfigSchema returns the configuration fields for the CLI
+func (p *AnthropicPlugin) ConfigSchema(ctx context.Context) ([]sdk.ConfigField, error) {
+	return []sdk.ConfigField{
+		{
+			Name:        "api_key",
+			Type:        "secret",
+			Description: "Anthropic API key (sk-ant-...)",
+			Required:    true,
+		},
+	}, nil
+}
+
+// Configure sets up the plugin with the provided config
+func (p *AnthropicPlugin) Configure(ctx context.Context, configJSON string) error {
+	var cfg AnthropicConfig
+	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+		return err
+	}
+
+	if cfg.APIKey == "" {
+		return errors.New("api_key is required")
+	}
+
+	p.config = &cfg
+	return nil
+}
+
+// Validate tests the configuration by making a test API call
+func (p *AnthropicPlugin) Validate(ctx context.Context) error {
+	if p.config == nil {
+		return errors.New("plugin not configured")
+	}
+
+	// Make a simple API call to validate the key
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.anthropic.com/v1/models", nil)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("x-api-key", p.config.APIKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 401 {
+		return errors.New("invalid API key")
+	}
+	if resp.StatusCode != 200 {
+		body, _ := io.ReadAll(resp.Body)
+		return errors.New("API error: " + string(body))
+	}
+
+	return nil
+}
+
+// Scopes returns the scopes this plugin supports
 func (p *AnthropicPlugin) Scopes(ctx context.Context) ([]sdk.ScopeSpec, error) {
 	return []sdk.ScopeSpec{
 		{
@@ -119,155 +117,42 @@ func (p *AnthropicPlugin) Scopes(ctx context.Context) ([]sdk.ScopeSpec, error) {
 	}, nil
 }
 
-func (p *AnthropicPlugin) ConfigSchema(ctx context.Context) ([]sdk.ConfigField, error) {
-	return []sdk.ConfigField{
-		{
-			Name:        "api_key",
-			Type:        "secret",
-			Description: "Anthropic API key",
-			Required:    true,
-		},
-		{
-			Name:        "proxy_port",
-			Type:        "number",
-			Description: "Port for the proxy server (default 8401)",
-			Required:    false,
-		},
-	}, nil
-}
-
-func (p *AnthropicPlugin) Constraints(ctx context.Context) (*sdk.Constraints, error) {
-	return nil, nil
-}
-
-func (p *AnthropicPlugin) Configure(ctx context.Context, configJSON string) error {
-	var config AnthropicConfig
-	if err := json.Unmarshal([]byte(configJSON), &config); err != nil {
-		return fmt.Errorf("invalid config JSON: %w", err)
-	}
-
-	if config.APIKey == "" {
-		return fmt.Errorf("api_key is required")
-	}
-
-	if config.ProxyPort == 0 {
-		config.ProxyPort = 8401
-	}
-
-	p.mu.Lock()
-	p.config = &config
-	p.proxyPort = config.ProxyPort
-	p.mu.Unlock()
-
-	return nil
-}
-
-func (p *AnthropicPlugin) Validate(ctx context.Context) error {
-	p.mu.RLock()
-	config := p.config
-	p.mu.RUnlock()
-
-	if config == nil {
-		return fmt.Errorf("plugin not configured")
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.anthropic.com/v1/models", nil)
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("x-api-key", config.APIKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to validate API key: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("invalid API key")
-	}
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("anthropic API error (%d): %s", resp.StatusCode, string(body))
-	}
-
-	return nil
-}
-
-func (p *AnthropicPlugin) GetCredential(ctx context.Context, req *sdk.CredentialRequest) (*sdk.Credential, error) {
-	p.mu.RLock()
-	config := p.config
-	proxyPort := p.proxyPort
-	p.mu.RUnlock()
-
-	if config == nil {
-		return nil, fmt.Errorf("plugin not configured")
-	}
-
-	token, err := generateToken()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate token: %w", err)
-	}
-
-	// Store token for proxy validation
-	p.store.Add(token, &TokenInfo{
-		AgentName: req.Agent.Name,
-		Scope:     req.Scope,
-		CreatedAt: time.Now(),
-	})
-
-	proxyURL := fmt.Sprintf("http://localhost:%d", proxyPort)
-
-	return &sdk.Credential{
-		Value:      token,
-		ExternalID: token,
-		ExpiresAt:  time.Now().Add(req.TTL),
-		Metadata: map[string]string{
-			"proxy_url":  proxyURL,
-			"agent_name": req.Agent.Name,
-			"scope":      req.Scope,
-		},
-	}, nil
-}
-
-func (p *AnthropicPlugin) RevokeCredential(ctx context.Context, externalID string) error {
-	p.store.Remove(externalID)
-	return nil
-}
-
+// MatchScope checks if this plugin handles the given scope
 func (p *AnthropicPlugin) MatchScope(ctx context.Context, scope string) (bool, error) {
-	return scope == "anthropic" || strings.HasPrefix(scope, "anthropic:"), nil
+	return strings.HasPrefix(scope, "anthropic"), nil
 }
 
-// --- Proxy support ---
+// Constraints returns TTL constraints for this plugin
+func (p *AnthropicPlugin) Constraints(ctx context.Context) (*sdk.Constraints, error) {
+	// Anthropic doesn't have programmatic key management,
+	// so we rely on Creddy's credential caching. Longer TTLs
+	// are fine since the same key is reused.
+	return &sdk.Constraints{
+		MinTTL:      1 * time.Minute,
+		MaxTTL:      24 * time.Hour,
+		Description: "Anthropic uses a shared API key via Creddy proxy",
+	}, nil
+}
 
-func (p *AnthropicPlugin) GetAPIKey() string {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+// GetCredential returns the API key for Anthropic
+// This is called by Creddy when proxying requests
+func (p *AnthropicPlugin) GetCredential(ctx context.Context, req *sdk.CredentialRequest) (*sdk.Credential, error) {
 	if p.config == nil {
-		return ""
+		return nil, errors.New("plugin not configured")
 	}
-	return p.config.APIKey
+
+	// For Anthropic, we just return the API key
+	// Creddy handles proxying and credential injection
+	return &sdk.Credential{
+		Value:      p.config.APIKey,
+		ExpiresAt:  time.Now().Add(req.TTL),
+		ExternalID: "", // Not revocable
+	}, nil
 }
 
-func (p *AnthropicPlugin) ValidateToken(token string) (*TokenInfo, bool) {
-	return p.store.Exists(token)
-}
-
-func (p *AnthropicPlugin) GetProxyPort() int {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.proxyPort
-}
-
-func (p *AnthropicPlugin) GetTokenCount() int {
-	return p.store.Count()
-}
-
-func (p *AnthropicPlugin) IsConfigured() bool {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	return p.config != nil
+// RevokeCredential is a no-op for Anthropic (no key management API)
+func (p *AnthropicPlugin) RevokeCredential(ctx context.Context, credential string) error {
+	// Anthropic doesn't support key revocation via API
+	// The shared key continues to be valid
+	return nil
 }

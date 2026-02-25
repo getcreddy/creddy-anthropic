@@ -1,101 +1,59 @@
 package main
 
 import (
-	"encoding/json"
-	"flag"
-	"log"
+	"fmt"
 	"os"
-	"os/signal"
-	"syscall"
-	"time"
 
 	sdk "github.com/getcreddy/creddy-plugin-sdk"
 )
 
-var plugin *AnthropicPlugin
-
 func main() {
-	// CLI flags for standalone/testing
-	standaloneProxy := flag.Bool("proxy", false, "Run proxy in standalone mode (for testing)")
-	proxyAddr := flag.String("addr", ":8401", "Proxy listen address")
-	apiKey := flag.String("api-key", "", "Anthropic API key (or ANTHROPIC_API_KEY env)")
-	flag.Parse()
+	// Handle CLI commands for plugin info
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "info":
+			fmt.Printf("Name:              %s\n", PluginName)
+			fmt.Printf("Version:           %s\n", PluginVersion)
+			fmt.Printf("Description:       Anthropic API access via Creddy proxy\n")
+			fmt.Printf("Min Creddy Version: 0.4.0\n")
+			return
 
-	// Create the shared plugin instance
-	plugin = NewAnthropicPlugin()
+		case "scopes":
+			fmt.Println("Pattern: anthropic")
+			fmt.Println("  Description: Full access to the Anthropic API")
+			fmt.Println("  Examples:")
+			fmt.Println("    - anthropic")
+			fmt.Println()
+			fmt.Println("Pattern: anthropic:claude")
+			fmt.Println("  Description: Access to Claude models")
+			fmt.Println("  Examples:")
+			fmt.Println("    - anthropic:claude")
+			return
 
-	if *standaloneProxy {
-		runStandaloneProxy(*proxyAddr, *apiKey)
-		return
-	}
-
-	// Check if running as Creddy plugin (gRPC mode)
-	if os.Getenv("CREDDY_PLUGIN") == "creddy" {
-		runAsCreddyPlugin()
-		return
-	}
-
-	// Default: standalone CLI for testing
-	sdk.ServeWithStandalone(plugin, nil)
-}
-
-// runAsCreddyPlugin runs the plugin with integrated proxy
-func runAsCreddyPlugin() {
-	// Get proxy port from env (Creddy can set this)
-	proxyPort := os.Getenv("CREDDY_ANTHROPIC_PROXY_PORT")
-	if proxyPort == "" {
-		proxyPort = "8401"
-	}
-
-	// Start proxy server in background
-	// It will wait for Configure() to be called before it can validate tokens
-	go func() {
-		proxy := NewProxy(plugin, ":"+proxyPort)
-		log.Printf("[anthropic] Starting proxy on :%s", proxyPort)
-		if err := proxy.Start(); err != nil {
-			log.Printf("[anthropic] Proxy error: %v", err)
+		case "help", "-h", "--help":
+			fmt.Println("creddy-anthropic - Anthropic plugin for Creddy")
+			fmt.Println()
+			fmt.Println("Commands:")
+			fmt.Println("  info     Show plugin information")
+			fmt.Println("  scopes   List supported scopes")
+			fmt.Println("  help     Show this help")
+			fmt.Println()
+			fmt.Println("This plugin runs as a Creddy plugin process. Configure in Creddy with:")
+			fmt.Println()
+			fmt.Println("  creddy backend add anthropic --config '{")
+			fmt.Println("    \"api_key\": \"sk-ant-...\",")
+			fmt.Println("    \"proxy\": {")
+			fmt.Println("      \"upstream_url\": \"https://api.anthropic.com\",")
+			fmt.Println("      \"header_name\": \"x-api-key\"")
+			fmt.Println("    }")
+			fmt.Println("  }'")
+			fmt.Println()
+			fmt.Println("Agents configure:")
+			fmt.Println("  ANTHROPIC_BASE_URL=http://creddy:8400/v1/proxy/anthropic")
+			return
 		}
-	}()
-
-	// Give proxy a moment to start
-	time.Sleep(100 * time.Millisecond)
-
-	// Run the SDK server (handles gRPC calls from Creddy)
-	sdk.Serve(plugin)
-}
-
-// runStandaloneProxy runs just the proxy for testing
-func runStandaloneProxy(addr string, apiKey string) {
-	if apiKey == "" {
-		apiKey = os.Getenv("ANTHROPIC_API_KEY")
-	}
-	if apiKey == "" {
-		log.Fatal("API key required: --api-key or ANTHROPIC_API_KEY env")
 	}
 
-	configJSON, _ := json.Marshal(map[string]interface{}{
-		"api_key": apiKey,
-	})
-
-	if err := plugin.Configure(nil, string(configJSON)); err != nil {
-		log.Fatalf("Configure failed: %v", err)
-	}
-
-	// Handle shutdown
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-
-	go func() {
-		<-sigChan
-		log.Println("Shutting down...")
-		os.Exit(0)
-	}()
-
-	log.Printf("[anthropic] Standalone proxy on %s", addr)
-	log.Printf("[anthropic] WARNING: Standalone mode - tokens won't persist across restarts")
-
-	proxy := NewProxy(plugin, addr)
-	if err := proxy.Start(); err != nil {
-		log.Fatalf("Proxy failed: %v", err)
-	}
+	// Run as plugin
+	sdk.Serve(NewPlugin())
 }
