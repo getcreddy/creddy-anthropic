@@ -1,12 +1,15 @@
 package main
 
 import (
-	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
+	"sync"
 	"time"
 
 	sdk "github.com/getcreddy/creddy-plugin-sdk"
@@ -14,32 +17,96 @@ import (
 
 const (
 	PluginName    = "anthropic"
-	PluginVersion = "0.1.0"
+	PluginVersion = "0.0.1"
 )
 
 // AnthropicPlugin implements the Creddy Plugin interface for Anthropic
 type AnthropicPlugin struct {
 	config *AnthropicConfig
+	store  *TokenStore
 }
 
 // AnthropicConfig contains the plugin configuration
 type AnthropicConfig struct {
-	AdminKey string `json:"admin_key"` // Admin API key for managing keys
+	APIKey       string `json:"api_key"`        // Real Anthropic API key
+	CreddyServer string `json:"creddy_server"`  // Creddy server URL (for proxy validation)
 }
 
-// anthropicAPIKey represents an API key returned by the Admin API
-type anthropicAPIKey struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Key       string    `json:"key"` // Only returned on creation
-	CreatedAt time.Time `json:"created_at"`
+// TokenStore manages the mapping between Creddy tokens and the real API key
+type TokenStore struct {
+	mu     sync.RWMutex
+	tokens map[string]*TokenInfo
+}
+
+// TokenInfo holds token metadata
+type TokenInfo struct {
+	AgentName string
+	Scope     string
+	ExpiresAt time.Time
+	CreatedAt time.Time
+}
+
+// NewTokenStore creates a new token store
+func NewTokenStore() *TokenStore {
+	return &TokenStore{
+		tokens: make(map[string]*TokenInfo),
+	}
+}
+
+// Add stores a new token
+func (s *TokenStore) Add(token string, info *TokenInfo) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tokens[token] = info
+}
+
+// Get retrieves token info if valid
+func (s *TokenStore) Get(token string) (*TokenInfo, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	info, ok := s.tokens[token]
+	if !ok {
+		return nil, false
+	}
+	if time.Now().After(info.ExpiresAt) {
+		return nil, false
+	}
+	return info, true
+}
+
+// Remove deletes a token
+func (s *TokenStore) Remove(token string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.tokens, token)
+}
+
+// Cleanup removes expired tokens
+func (s *TokenStore) Cleanup() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	now := time.Now()
+	for token, info := range s.tokens {
+		if now.After(info.ExpiresAt) {
+			delete(s.tokens, token)
+		}
+	}
+}
+
+// generateToken creates a secure random token
+func generateToken() (string, error) {
+	bytes := make([]byte, 32)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return "crd_" + hex.EncodeToString(bytes), nil
 }
 
 func (p *AnthropicPlugin) Info(ctx context.Context) (*sdk.PluginInfo, error) {
 	return &sdk.PluginInfo{
 		Name:             PluginName,
 		Version:          PluginVersion,
-		Description:      "Ephemeral Anthropic API keys via Admin API (Scale/Enterprise plans)",
+		Description:      "Anthropic API access via proxy (no Admin API required)",
 		MinCreddyVersion: "0.4.0",
 	}, nil
 }
@@ -62,16 +129,15 @@ func (p *AnthropicPlugin) Scopes(ctx context.Context) ([]sdk.ScopeSpec, error) {
 func (p *AnthropicPlugin) ConfigSchema(ctx context.Context) ([]sdk.ConfigField, error) {
 	return []sdk.ConfigField{
 		{
-			Name:        "admin_key",
+			Name:        "api_key",
 			Type:        "secret",
-			Description: "Anthropic Admin API key (requires Scale/Enterprise plan)",
+			Description: "Anthropic API key (regular key, not admin)",
 			Required:    true,
 		},
 	}, nil
 }
 
 func (p *AnthropicPlugin) Constraints(ctx context.Context) (*sdk.Constraints, error) {
-	// Anthropic API keys don't have inherent TTL limits - Creddy manages expiration via revocation
 	return nil, nil
 }
 
@@ -81,11 +147,21 @@ func (p *AnthropicPlugin) Configure(ctx context.Context, configJSON string) erro
 		return fmt.Errorf("invalid config JSON: %w", err)
 	}
 
-	if config.AdminKey == "" {
-		return fmt.Errorf("admin_key is required")
+	if config.APIKey == "" {
+		return fmt.Errorf("api_key is required")
 	}
 
 	p.config = &config
+	p.store = NewTokenStore()
+
+	// Start background cleanup
+	go func() {
+		ticker := time.NewTicker(1 * time.Minute)
+		for range ticker.C {
+			p.store.Cleanup()
+		}
+	}()
+
 	return nil
 }
 
@@ -94,26 +170,23 @@ func (p *AnthropicPlugin) Validate(ctx context.Context) error {
 		return fmt.Errorf("plugin not configured")
 	}
 
-	// Test the admin key by listing existing keys
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.anthropic.com/v1/api_keys", nil)
+	// Validate the API key by making a simple request
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.anthropic.com/v1/models", nil)
 	if err != nil {
 		return err
 	}
 
-	req.Header.Set("x-api-key", p.config.AdminKey)
+	req.Header.Set("x-api-key", p.config.APIKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to validate admin key: %w", err)
+		return fmt.Errorf("failed to validate API key: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		return fmt.Errorf("invalid admin key")
-	}
-	if resp.StatusCode == http.StatusForbidden {
-		return fmt.Errorf("admin key does not have permission to manage API keys (requires Scale/Enterprise plan)")
+		return fmt.Errorf("invalid API key")
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -128,23 +201,31 @@ func (p *AnthropicPlugin) GetCredential(ctx context.Context, req *sdk.Credential
 		return nil, fmt.Errorf("plugin not configured")
 	}
 
-	// Create a new API key with a unique name
-	name := fmt.Sprintf("creddy-%s-%d", req.Agent.Name, time.Now().UnixNano())
-
-	apiKey, err := p.createAPIKey(ctx, name)
+	// Generate a Creddy token (NOT the real Anthropic key)
+	token, err := generateToken()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to generate token: %w", err)
 	}
 
-	// Anthropic keys don't have inherent expiry - Creddy manages TTL
-	// The key ID is stored as ExternalID for revocation
+	expiresAt := time.Now().Add(req.TTL)
+
+	// Store the token mapping
+	p.store.Add(token, &TokenInfo{
+		AgentName: req.Agent.Name,
+		Scope:     req.Scope,
+		ExpiresAt: expiresAt,
+		CreatedAt: time.Now(),
+	})
+
 	return &sdk.Credential{
-		Value:      apiKey.Key,
-		ExternalID: apiKey.ID,
-		ExpiresAt:  time.Now().Add(req.TTL),
+		Value:      token,
+		ExternalID: token, // Use token as external ID for revocation
+		ExpiresAt:  expiresAt,
 		Metadata: map[string]string{
-			"key_id":   apiKey.ID,
-			"key_name": name,
+			"type":       "proxy_token",
+			"agent_name": req.Agent.Name,
+			"scope":      req.Scope,
+			"note":       "Use with ANTHROPIC_BASE_URL pointing to the Creddy Anthropic proxy",
 		},
 	}, nil
 }
@@ -154,69 +235,23 @@ func (p *AnthropicPlugin) RevokeCredential(ctx context.Context, externalID strin
 		return fmt.Errorf("plugin not configured")
 	}
 
-	return p.deleteAPIKey(ctx, externalID)
+	p.store.Remove(externalID)
+	return nil
 }
 
 func (p *AnthropicPlugin) MatchScope(ctx context.Context, scope string) (bool, error) {
-	// Match "anthropic" or "anthropic:*"
-	return scope == "anthropic" || len(scope) > 10 && scope[:10] == "anthropic:", nil
+	return scope == "anthropic" || strings.HasPrefix(scope, "anthropic:"), nil
 }
 
-// --- Anthropic Admin API helpers ---
-
-func (p *AnthropicPlugin) createAPIKey(ctx context.Context, name string) (*anthropicAPIKey, error) {
-	reqBody, _ := json.Marshal(map[string]interface{}{
-		"name": name,
-	})
-
-	req, err := http.NewRequestWithContext(ctx, "POST", "https://api.anthropic.com/v1/api_keys", bytes.NewReader(reqBody))
-	if err != nil {
-		return nil, err
+// GetAPIKey returns the real API key (for proxy use)
+func (p *AnthropicPlugin) GetAPIKey() string {
+	if p.config == nil {
+		return ""
 	}
-
-	req.Header.Set("x-api-key", p.config.AdminKey)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create API key: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, _ := io.ReadAll(resp.Body)
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return nil, fmt.Errorf("anthropic API error (%d): %s", resp.StatusCode, string(body))
-	}
-
-	var key anthropicAPIKey
-	if err := json.Unmarshal(body, &key); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
-	}
-
-	return &key, nil
+	return p.config.APIKey
 }
 
-func (p *AnthropicPlugin) deleteAPIKey(ctx context.Context, keyID string) error {
-	req, err := http.NewRequestWithContext(ctx, "DELETE", "https://api.anthropic.com/v1/api_keys/"+keyID, nil)
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("x-api-key", p.config.AdminKey)
-	req.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to delete API key: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotFound {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("anthropic API error (%d): %s", resp.StatusCode, string(body))
-	}
-
-	return nil
+// ValidateToken checks if a token is valid and returns its info
+func (p *AnthropicPlugin) ValidateToken(token string) (*TokenInfo, bool) {
+	return p.store.Get(token)
 }
