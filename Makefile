@@ -1,4 +1,4 @@
-.PHONY: build test clean install dev info validate
+.PHONY: build test test-integration clean install dev info validate
 
 BINARY_NAME=creddy-anthropic
 VERSION=$(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -28,6 +28,10 @@ release-dev: build-all
 	@echo "Pushed! Install with: creddy plugin install ttl.sh/$(BINARY_NAME):dev"
 
 # Run tests
+test-integration:
+	go test -v -tags=integration ./...
+
+# Run unit tests
 test:
 	go test -v ./...
 
