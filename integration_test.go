@@ -34,6 +34,58 @@ func getProxyPort() int {
 	return 18401
 }
 
+// doRequestWithRetry handles transient Anthropic errors (429, 529) with retry
+func doRequestWithRetry(t *testing.T, req *http.Request, maxRetries int) (*http.Response, []byte) {
+	t.Helper()
+	var resp *http.Response
+	var body []byte
+	var err error
+
+	for i := 0; i <= maxRetries; i++ {
+		if i > 0 {
+			// Clone the request body for retry
+			if req.GetBody != nil {
+				req.Body, _ = req.GetBody()
+			}
+			time.Sleep(time.Duration(i) * time.Second)
+		}
+
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("request failed: %v", err)
+		}
+
+		body, _ = io.ReadAll(resp.Body)
+		resp.Body.Close()
+
+		// Retry on transient errors
+		if resp.StatusCode == 429 || resp.StatusCode == 529 {
+			if i < maxRetries {
+				t.Logf("Got %d, retrying (%d/%d)...", resp.StatusCode, i+1, maxRetries)
+				continue
+			}
+			t.Skipf("Anthropic API overloaded (status %d) after %d retries, skipping test", resp.StatusCode, maxRetries)
+		}
+
+		break
+	}
+
+	return resp, body
+}
+
+// makeProxyRequest creates a request to the proxy with proper headers
+func makeProxyRequest(port int, token, body string) *http.Request {
+	proxyURL := fmt.Sprintf("http://localhost:%d/v1/messages", port)
+	req, _ := http.NewRequest("POST", proxyURL, strings.NewReader(body))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader(body)), nil
+	}
+	req.Header.Set("x-api-key", token)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-version", "2023-06-01")
+	return req
+}
+
 func TestIntegration_PluginInfo(t *testing.T) {
 	plugin := NewPlugin()
 	info, err := plugin.Info(context.Background())
@@ -196,16 +248,14 @@ func TestIntegration_FullProxyLifecycle(t *testing.T) {
 	time.Sleep(200 * time.Millisecond)
 
 	// Create credential
-	req := &sdk.CredentialRequest{
+	cred, err := plugin.GetCredential(context.Background(), &sdk.CredentialRequest{
 		Scope: "anthropic",
 		TTL:   5 * time.Minute,
 		Agent: sdk.Agent{
 			ID:   "lifecycle-test",
 			Name: "lifecycle-test",
 		},
-	}
-
-	cred, err := plugin.GetCredential(context.Background(), req)
+	})
 	if err != nil {
 		t.Fatalf("GetCredential() error: %v", err)
 	}
@@ -213,25 +263,14 @@ func TestIntegration_FullProxyLifecycle(t *testing.T) {
 
 	// Test proxy with valid token
 	t.Run("valid token works", func(t *testing.T) {
-		proxyURL := fmt.Sprintf("http://localhost:%d/v1/messages", port)
 		body := `{
 			"model": "claude-3-haiku-20240307",
 			"max_tokens": 10,
 			"messages": [{"role": "user", "content": "Say 'test'"}]
 		}`
 
-		httpReq, _ := http.NewRequest("POST", proxyURL, strings.NewReader(body))
-		httpReq.Header.Set("x-api-key", cred.Value)
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("anthropic-version", "2023-06-01")
-
-		resp, err := http.DefaultClient.Do(httpReq)
-		if err != nil {
-			t.Fatalf("proxy request failed: %v", err)
-		}
-		defer resp.Body.Close()
-
-		respBody, _ := io.ReadAll(resp.Body)
+		req := makeProxyRequest(port, cred.Value, body)
+		resp, respBody := doRequestWithRetry(t, req, 3)
 
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("proxy request failed: status=%d body=%s", resp.StatusCode, string(respBody))
@@ -257,23 +296,18 @@ func TestIntegration_FullProxyLifecycle(t *testing.T) {
 
 	// Test proxy rejects revoked token
 	t.Run("revoked token rejected", func(t *testing.T) {
-		proxyURL := fmt.Sprintf("http://localhost:%d/v1/messages", port)
 		body := `{
 			"model": "claude-3-haiku-20240307",
 			"max_tokens": 10,
 			"messages": [{"role": "user", "content": "Say 'test'"}]
 		}`
 
-		httpReq, _ := http.NewRequest("POST", proxyURL, strings.NewReader(body))
-		httpReq.Header.Set("x-api-key", cred.Value)
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("anthropic-version", "2023-06-01")
-
-		resp, err := http.DefaultClient.Do(httpReq)
+		req := makeProxyRequest(port, cred.Value, body)
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatalf("proxy request failed: %v", err)
 		}
-		defer resp.Body.Close()
+		resp.Body.Close()
 
 		if resp.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("expected 401 for revoked token, got %d", resp.StatusCode)
@@ -307,15 +341,10 @@ func TestIntegration_InvalidTokenRejected(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			proxyURL := fmt.Sprintf("http://localhost:%d/v1/messages", port)
 			body := `{"model": "claude-3-haiku-20240307", "max_tokens": 10, "messages": [{"role": "user", "content": "test"}]}`
+			req := makeProxyRequest(port, tt.token, body)
 
-			httpReq, _ := http.NewRequest("POST", proxyURL, strings.NewReader(body))
-			httpReq.Header.Set("x-api-key", tt.token)
-			httpReq.Header.Set("Content-Type", "application/json")
-			httpReq.Header.Set("anthropic-version", "2023-06-01")
-
-			resp, err := http.DefaultClient.Do(httpReq)
+			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Fatalf("request failed: %v", err)
 			}
@@ -383,24 +412,15 @@ func TestIntegration_ConcurrentTokens(t *testing.T) {
 	}
 	t.Logf("Generated %d unique tokens concurrently ✓", numTokens)
 
-	// Test one token works through proxy (don't test all to save API calls)
-	proxyURL := fmt.Sprintf("http://localhost:%d/v1/messages", port)
+	// Test one token works through proxy (with retry for transient errors)
 	body := `{
 		"model": "claude-3-haiku-20240307",
 		"max_tokens": 5,
 		"messages": [{"role": "user", "content": "Hi"}]
 	}`
 
-	httpReq, _ := http.NewRequest("POST", proxyURL, strings.NewReader(body))
-	httpReq.Header.Set("x-api-key", tokens[0].Value)
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		t.Fatalf("proxy request failed: %v", err)
-	}
-	resp.Body.Close()
+	req := makeProxyRequest(port, tokens[0].Value, body)
+	resp, _ := doRequestWithRetry(t, req, 3)
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200, got %d", resp.StatusCode)
@@ -455,15 +475,10 @@ func TestIntegration_TokenExpiry(t *testing.T) {
 	time.Sleep(shortTTL + 500*time.Millisecond)
 
 	// Verify proxy rejects expired token
-	proxyURL := fmt.Sprintf("http://localhost:%d/v1/messages", port)
 	body := `{"model": "claude-3-haiku-20240307", "max_tokens": 5, "messages": [{"role": "user", "content": "test"}]}`
+	req := makeProxyRequest(port, cred.Value, body)
 
-	httpReq, _ := http.NewRequest("POST", proxyURL, strings.NewReader(body))
-	httpReq.Header.Set("x-api-key", cred.Value)
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
-
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -501,7 +516,7 @@ func TestIntegration_SSEStreaming(t *testing.T) {
 	}
 	defer plugin.RevokeCredential(context.Background(), cred.ExternalID)
 
-	// Test streaming request
+	// Test streaming request with retry
 	proxyURL := fmt.Sprintf("http://localhost:%d/v1/messages", port)
 	body := `{
 		"model": "claude-3-haiku-20240307",
@@ -510,14 +525,28 @@ func TestIntegration_SSEStreaming(t *testing.T) {
 		"messages": [{"role": "user", "content": "Count to 3"}]
 	}`
 
-	httpReq, _ := http.NewRequest("POST", proxyURL, strings.NewReader(body))
-	httpReq.Header.Set("x-api-key", cred.Value)
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
+	var resp *http.Response
+	for i := 0; i <= 3; i++ {
+		req, _ := http.NewRequest("POST", proxyURL, strings.NewReader(body))
+		req.Header.Set("x-api-key", cred.Value)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("anthropic-version", "2023-06-01")
 
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		t.Fatalf("streaming request failed: %v", err)
+		resp, err = http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("streaming request failed: %v", err)
+		}
+
+		if resp.StatusCode == 429 || resp.StatusCode == 529 {
+			resp.Body.Close()
+			if i < 3 {
+				t.Logf("Got %d, retrying...", resp.StatusCode)
+				time.Sleep(time.Duration(i+1) * time.Second)
+				continue
+			}
+			t.Skipf("Anthropic API overloaded, skipping SSE test")
+		}
+		break
 	}
 	defer resp.Body.Close()
 
@@ -615,22 +644,20 @@ func TestIntegration_ProxyForwardsHeaders(t *testing.T) {
 		"messages": [{"role": "user", "content": "Hi"}]
 	}`
 
-	httpReq, _ := http.NewRequest("POST", proxyURL, bytes.NewBufferString(body))
-	httpReq.Header.Set("x-api-key", cred.Value)
-	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("anthropic-version", "2023-06-01")
-	httpReq.Header.Set("anthropic-beta", "messages-2023-12-15") // Custom beta header
-
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
+	req, _ := http.NewRequest("POST", proxyURL, bytes.NewBufferString(body))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewBufferString(body)), nil
 	}
-	defer resp.Body.Close()
+	req.Header.Set("x-api-key", cred.Value)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("anthropic-version", "2023-06-01")
+	req.Header.Set("anthropic-beta", "messages-2023-12-15") // Custom beta header
+
+	resp, respBody := doRequestWithRetry(t, req, 3)
 
 	// Should succeed (headers forwarded correctly)
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		t.Fatalf("request failed: status=%d body=%s", resp.StatusCode, string(body))
+		t.Fatalf("request failed: status=%d body=%s", resp.StatusCode, string(respBody))
 	}
 
 	t.Log("Headers forwarded correctly ✓")
