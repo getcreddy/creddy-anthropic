@@ -64,7 +64,7 @@ func doRequestWithRetry(t *testing.T, req *http.Request, maxRetries int) (*http.
 				t.Logf("Got %d, retrying (%d/%d)...", resp.StatusCode, i+1, maxRetries)
 				continue
 			}
-			t.Skipf("Anthropic API overloaded (status %d) after %d retries, skipping test", resp.StatusCode, maxRetries)
+			t.Fatalf("Anthropic API overloaded (status %d) after %d retries, failing test", resp.StatusCode, maxRetries)
 		}
 
 		break
@@ -544,7 +544,7 @@ func TestIntegration_SSEStreaming(t *testing.T) {
 				time.Sleep(time.Duration(i+1) * time.Second)
 				continue
 			}
-			t.Skipf("Anthropic API overloaded, skipping SSE test")
+			t.Fatalf("Anthropic API overloaded, failing test")
 		}
 		break
 	}
